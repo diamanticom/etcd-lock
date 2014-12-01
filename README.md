@@ -25,13 +25,13 @@ func processEvents(eventsCh <-chan utils.MasterEvent) {
         case e := <-k.eventsCh:
             if e.Type == utils.MasterAdded {
                // Acquired the lock.
-        } else if e.Type == utils.MasterDeleted {
+            } else if e.Type == utils.MasterDeleted {
                // Lost the lock.
             } else {
                // Lock ownership changed.
             }
         ...
-            }
+        }
      }
 }
 ```
