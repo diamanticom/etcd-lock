@@ -195,7 +195,7 @@ func (e *etcdLock) acquire() (ret error) {
 				glog.Info("Got nil resp in watch channel")
 				continue
 			}
-			if resp.Action == "delete" {
+			if resp.Action == "expire" || resp.Action == "delete" {
 				if e.holding {
 					// This shouldn't normally happen.
 					glog.Errorf("Unexpected delete for lock %s", e.name)
