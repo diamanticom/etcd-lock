@@ -1,7 +1,18 @@
 etcd-lock
 =========
 
-Distributed lock implementation using etcd
+master.go
+  - Master election using etcd.
+  - TTL is refreshed by the lockholder.
+  - Master failure results in another node acquiring the lock and becoming master.
+  - Sample usage below.
+
+rwlock.go
+  - Distributed read write lock implementation using etcd.
+  - Implemented using CreateInOrder (queue).
+  - Fairness ensured by not letting reads leapfrog writes.
+  - Queue TTL protects against node failures after requesting a lock.
+  - Lock TTL protects against node failures after acquiring a lock.
 
 Sample usage
 ============
