@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Utility to perform master election/failover using etcd.
+
 package utils
 
 import (
@@ -107,6 +109,15 @@ func (e *etcdLock) Stop() {
 	e.stopCh <- true
 	// Wait for acquire to finish.
 	<-e.stoppedCh
+
+	// Delete the lock if holding it so other nodes can get it sooner.
+	// Otherwise they have wait until ttl expiry.
+	if e.holding {
+		if _, err := e.client.Delete(e.name, false); err != nil {
+			glog.Errorf("Failed to delete lock %s with error %s",
+				e.name, err.Error())
+		}
+	}
 }
 
 // Method to get the event channel used by the etcd lock.
