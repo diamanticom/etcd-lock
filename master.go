@@ -22,11 +22,14 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/coreos/go-etcd/etcd"
 	"github.com/golang/glog"
 )
+
+const kRetrySleep time.Duration = 100 // milliseconds
 
 // Various event types for the events channel.
 type MasterEventType int
@@ -62,13 +65,17 @@ type MasterInterface interface {
 
 // Internal structure to represent an etcd lock.
 type etcdLock struct {
+	sync.Mutex
 	client        Registry         // etcd interface
 	name          string           // name of the lock
 	id            string           // identity of the lockholder
 	ttl           uint64           // ttl of the lock
+	enabled       bool             // Used to enable/disable the lock
+	master        string           // Lock holder
+	watchStopCh   chan bool        // To stop the watch
 	eventsCh      chan MasterEvent // channel to send lock ownership updates
-	stopCh        chan bool        // channel to stop the acquire routine
 	stoppedCh     chan bool        // channel that waits for acquire to finish
+	refreshStopCh chan bool        // channel used to stop the refresh routine
 	holding       bool             // whether this node is holding the lock
 	modifiedIndex uint64           // valid only when this node is holding the lock
 }
@@ -82,15 +89,30 @@ func NewMaster(client Registry, name string, id string,
 	}
 
 	return &etcdLock{client: client, name: name, id: id, ttl: ttl,
-		eventsCh:  make(chan MasterEvent, 1),
-		stopCh:    make(chan bool, 1),
-		stoppedCh: make(chan bool, 1),
-		holding:   false, modifiedIndex: 0}, nil
+		enabled:       false,
+		master:        "",
+		watchStopCh:   make(chan bool, 1),
+		eventsCh:      make(chan MasterEvent, 1),
+		stoppedCh:     make(chan bool, 1),
+		refreshStopCh: make(chan bool, 1),
+		holding:       false,
+		modifiedIndex: 0}, nil
 }
 
 // Method to start the attempt to acquire the lock.
-// TODO: Check duplicate call.
 func (e *etcdLock) Start() {
+	glog.Infof("Starting attempt to acquire lock %s", e.name)
+
+	e.Lock()
+	if e.enabled {
+		// Already running
+		glog.Warningf("Duplicate Start for lock %s", e.name)
+		return
+	}
+
+	e.enabled = true
+	e.Unlock()
+
 	// Acquire in the background.
 	go func() {
 		// If acquire returns without error, exit. If not, acquire
@@ -105,19 +127,23 @@ func (e *etcdLock) Start() {
 
 // Method to stop the acquisition of lock and release it if holding the lock.
 func (e *etcdLock) Stop() {
-	// Stop the acquire routine (watch & refresh).
-	e.stopCh <- true
+	glog.Infof("Stopping attempt to acquire lock %s", e.name)
+
+	e.Lock()
+	if !e.enabled {
+		// Not running
+		glog.Warningf("Duplicate Stop for lock %s", e.name)
+		return
+	}
+
+	// Disable the lock and stop the watch.
+	e.enabled = false
+	e.Unlock()
+
+	e.watchStopCh <- true
+
 	// Wait for acquire to finish.
 	<-e.stoppedCh
-
-	// Delete the lock if holding it so other nodes can get it sooner.
-	// Otherwise they have wait until ttl expiry.
-	if e.holding {
-		if _, err := e.client.Delete(e.name, false); err != nil {
-			glog.Errorf("Failed to delete lock %s with error %s",
-				e.name, err.Error())
-		}
-	}
 }
 
 // Method to get the event channel used by the etcd lock.
@@ -127,35 +153,16 @@ func (e *etcdLock) EventsChan() <-chan MasterEvent {
 
 // Method to get the lockholder.
 func (e *etcdLock) GetHolder() string {
-	// Get the key.
-	if resp, err := e.client.Get(e.name, false, false); err == nil {
-		return resp.Node.Value
-	}
-
-	return ""
+	e.Lock()
+	defer e.Unlock()
+	return e.master
 }
 
-// Method to acquire the lock. It launches up to two goroutines, one to watch
-// the changes on the lock and another to refresh the ttl if successful in
-// acquiring the lock.
+// Method to acquire the lock. It launches another goroutine to refresh the ttl
+// if successful in acquiring the lock.
 func (e *etcdLock) acquire() (ret error) {
-	glog.V(2).Infof("acquire lock %s", e.name)
-
-	watchCh := make(chan *etcd.Response, 1)
-	watchFailCh := make(chan bool, 1)
-	watchStopCh := make(chan bool, 1)
-	refreshStopCh := make(chan bool, 1)
-
 	defer func() {
 		if r := recover(); r != nil {
-			// If this routine crashes, make sure the other watch and
-			// refresh routines are also stopped. The caller of this
-			// routine will restart this routine if an error is returned.
-			watchStopCh <- true
-			if e.holding {
-				e.holding = false
-				refreshStopCh <- true
-			}
 			callers := ""
 			for i := 0; true; i++ {
 				_, file, line, ok := runtime.Caller(i)
@@ -172,147 +179,128 @@ func (e *etcdLock) acquire() (ret error) {
 		}
 	}()
 
-	// Setup the watch first in order to not miss any notifications.
-	go e.watch(watchCh, watchStopCh, watchFailCh)
+	var resp *etcd.Response
+	// Initialize error to dummy.
+	err := fmt.Errorf("Dummy error")
 
-	// Get the key.
-	if resp, err := e.client.Get(e.name, false, false); err == nil {
-		// This can happen when the process restarts and ttl has not
-		// yet expired.
-		if resp.Node.Value == e.id {
-			glog.Infof("Acquired lock %s", e.name)
-			e.holding = true
-			e.modifiedIndex = resp.Node.ModifiedIndex
-			e.eventsCh <- MasterEvent{Type: MasterAdded, Master: e.id}
-			go e.refresh(refreshStopCh)
-		} else {
-			e.eventsCh <- MasterEvent{Type: MasterModified,
-				Master: resp.Node.Value}
-		}
-	} else if IsEtcdNotFound(err) {
-		// Try to acquire the lock.
-		e.tryAcquire(refreshStopCh)
-	} else {
-		// TODO: Retry get?
-		glog.Fatalf("Unexpected get error for lock %s: %s", e.id,
-			err.Error())
-	}
-
-	// TODO: What happens if etcd loses quorum?
 	for {
-		select {
-		case resp := <-watchCh:
-			if resp == nil {
-				glog.Info("Got nil resp in watch channel")
-				continue
-			}
-			if resp.Action == "expire" || resp.Action == "delete" {
-				if e.holding {
-					// This shouldn't normally happen.
-					glog.Errorf("Unexpected delete for lock %s", e.name)
-
-					e.holding = false
-					refreshStopCh <- true
-					// Create a new channel for the next go routine.
-					refreshStopCh = make(chan bool, 1)
-					e.eventsCh <- MasterEvent{Type: MasterDeleted,
-						Master: ""}
-				}
-
-				// Some other node gave up the lock, try to acquire.
-				e.tryAcquire(refreshStopCh)
-			} else if resp.Node.Value != e.id &&
-				(resp.PrevNode == nil ||
-					resp.Node.Value != resp.PrevNode.Value) {
-				// Lock acquired by some other node. PrevNode should
-				// never be nil as tryAcquire would have got the lock
-				// then. Suppress sending changed notification when the
-				// value doesn't change.
-				if e.holding {
-					// Somehow this node's lock was released.
-					glog.Errorf("Lost lock: old value %s, new "+
-						"value %s", e.id, resp.Node.Value)
-
-					e.holding = false
-					refreshStopCh <- true
-					// Create a new channel for the next go routine.
-					refreshStopCh = make(chan bool, 1)
-					e.eventsCh <- MasterEvent{Type: MasterDeleted,
-						Master: ""}
-				}
-				glog.V(2).Infof("Lock holder for %s changed to %s",
-					e.name, resp.Node.Value)
-				e.eventsCh <- MasterEvent{Type: MasterModified,
-					Master: resp.Node.Value}
-			}
-		case <-e.stopCh:
-			// Release was called, stop the watch routine. If holding
-			// the lock, stop the refresh routine and delete the key.
-			glog.V(2).Infof("Stopping watch for lock %s", e.name)
-			watchStopCh <- true
+		// Stop was called, stop the refresh routine if needed and
+		// abort the acquire routine.
+		if !e.enabled {
 			if e.holding {
-				refreshStopCh <- true
-				refreshStopCh = make(chan bool, 1)
-				glog.Infof("Deleting lock %s", e.name)
-				if _, err := e.client.Delete(e.name,
-					false); err != nil {
-					// Not fatal because ttl would expire.
-					glog.Errorf("Failed to delete lock %s with "+
-						"error: %s", e.name, err.Error())
+				glog.V(2).Infof("Deleting lock %s", e.name)
+				// Delete the lock so other nodes can get it sooner.
+				// Otherwise, they have to wait until ttl expiry.
+				if _, err = e.client.Delete(e.name, false); err != nil {
+					glog.V(2).Infof("Failed to delete lock %s, "+
+						"error %v", e.name, err)
 				}
-
 				e.holding = false
+				e.refreshStopCh <- true
+			}
+			// Wont be able to track the master.
+			e.Lock()
+			e.master = ""
+			e.Unlock()
+
+			e.stoppedCh <- true
+			break
+		}
+
+		// If there is an error (at the beginning or with watch) or if
+		// the lock is deleted, try to get the lockholder/acquire the lock.
+		if err != nil || resp.Node.Value == "" {
+			resp, err = e.client.Get(e.name, false, false)
+			if err != nil {
+				if IsEtcdErrorNotFound(err) {
+					// Try to acquire the lock.
+					glog.V(2).Infof("Trying to acquire lock %s", e.name)
+					resp, err = e.client.Create(e.name, e.id, e.ttl)
+					if err != nil {
+						// Failed to acquire the lock.
+						continue
+					}
+				} else {
+					glog.V(2).Infof("Failed to get lock %s, error: %v",
+						e.name, err)
+					time.Sleep(kRetrySleep * time.Millisecond)
+					continue
+				}
+			}
+		}
+
+		if resp.Node.Value == e.id {
+			// This node is the lock holder.
+			if !e.holding {
+				// If not already holding the lock, send an
+				// event and start the refresh routine.
+				glog.Infof("Acquired lock %s", e.name)
+				e.holding = true
+				e.eventsCh <- MasterEvent{Type: MasterAdded,
+					Master: e.id}
+				go e.refresh()
+			}
+		} else {
+			// Some other node is the lock holder.
+			if e.holding {
+				// If previously holding the lock, stop the
+				// refresh routine and send a deleted event.
+				glog.Errorf("Lost lock %s to %s", e.name,
+					resp.Node.Value)
+				e.holding = false
+				e.refreshStopCh <- true
 				e.eventsCh <- MasterEvent{Type: MasterDeleted,
 					Master: ""}
 			}
-			e.stoppedCh <- true
-			return nil
-		case <-watchFailCh:
-			// etcd client Watch closes the channel, hence the need
-			// to recreate.
-			watchCh = make(chan *etcd.Response, 1)
+			if e.master != resp.Node.Value {
+				// If master changed, send a modified event.
+				e.eventsCh <- MasterEvent{Type: MasterModified,
+					Master: resp.Node.Value}
+			}
+		}
 
-			// Restart the watch.
-			go e.watch(watchCh, watchStopCh, watchFailCh)
+		// Record the new master and modified index.
+		e.Lock()
+		e.master = resp.Node.Value
+		e.Unlock()
+		e.modifiedIndex = resp.Node.ModifiedIndex
+
+		var prevIndex uint64
+
+		// Intent is to start the watch using EtcdIndex. Sometimes, etcd
+		// is returning EtcdIndex lower than ModifiedIndex. In such
+		// cases, use ModifiedIndex to set the watch.
+		// TODO: Change this code when etcd behavior changes.
+		if resp.EtcdIndex < resp.Node.ModifiedIndex {
+			prevIndex = resp.Node.ModifiedIndex + 1
+		} else {
+			prevIndex = resp.EtcdIndex + 1
+		}
+
+		// Start watching for changes to lock.
+		resp, err = e.client.Watch(e.name, prevIndex, false, nil, e.watchStopCh)
+		if IsEtcdErrorWatchStoppedByUser(err) {
+			glog.Infof("Watch for lock %s stopped by user", e.name)
+		} else if err != nil {
+			// Log only if its not too old event index error.
+			if !IsEtcdErrorEventIndexCleared(err) {
+				glog.Errorf("Failed to watch lock %s, error %v",
+					e.name, err)
+			}
 		}
 	}
 
-	return ret
-}
-
-// Method to try and acquire the lock.
-func (e *etcdLock) tryAcquire(refreshStopCh chan bool) {
-	glog.V(2).Infof("tryAcquire lock %s", e.name)
-	// Attempt to create the key.
-	if resp, err := e.client.Create(e.name, e.id, e.ttl); err == nil {
-		// Acquired the lock.
-		glog.Infof("Acquired lock %s", e.name)
-		e.holding = true
-		e.modifiedIndex = resp.Node.ModifiedIndex
-		e.eventsCh <- MasterEvent{Type: MasterAdded, Master: e.id}
-		go e.refresh(refreshStopCh)
-	}
-}
-
-// Method to watch the lock.
-func (e *etcdLock) watch(watchCh chan *etcd.Response, watchStopCh chan bool,
-	watchFailCh chan bool) {
-	glog.V(2).Infof("watch lock %s", e.name)
-	if _, err := e.client.Watch(e.name, 0, false, watchCh,
-		watchStopCh); IsEtcdWatchStoppedByUser(err) {
-		glog.V(2).Infof("Stopping watch for lock %s", e.name)
-		return
-	} else {
-		glog.Infof("Watch returned err %s for key %s", err.Error(),
-			e.name)
-		watchFailCh <- true
-	}
+	return nil
 }
 
 // Method to refresh the lock. It refreshes the ttl at ttl*4/10 interval.
-func (e *etcdLock) refresh(stopCh chan bool) {
+func (e *etcdLock) refresh() {
 	for {
 		select {
+		case <-e.refreshStopCh:
+			glog.V(2).Infof("Stopping refresh for lock %s", e.name)
+			// Lock released.
+			return
 		case <-time.After(time.Second * time.Duration(e.ttl*4/10)):
 			// Uses CompareAndSwap to protect against the case where a
 			// watch is received with a "delete" and refresh routine is
@@ -328,10 +316,6 @@ func (e *etcdLock) refresh(stopCh chan bool) {
 			} else {
 				e.modifiedIndex = resp.Node.ModifiedIndex
 			}
-		case <-stopCh:
-			glog.V(2).Infof("Stopping refresh for lock %s", e.name)
-			// Lock released.
-			return
 		}
 	}
 }
