@@ -105,6 +105,7 @@ func (e *etcdLock) Start() {
 
 	e.Lock()
 	if e.enabled {
+		e.Unlock()
 		// Already running
 		glog.Warningf("Duplicate Start for lock %s", e.name)
 		return
@@ -131,6 +132,7 @@ func (e *etcdLock) Stop() {
 
 	e.Lock()
 	if !e.enabled {
+		e.Unlock()
 		// Not running
 		glog.Warningf("Duplicate Stop for lock %s", e.name)
 		return
