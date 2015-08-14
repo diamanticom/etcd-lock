@@ -22,7 +22,8 @@ import (
 )
 
 const (
-	EtcdErrorCodeNotFound = 100
+	EtcdErrorCodeNotFound     = 100
+	EtcdErrorCodeIndexCleared = 401
 )
 
 var (
@@ -38,6 +39,11 @@ func IsEtcdNotFound(err error) bool {
 // IsEtcdWatchStoppedByUser checks if err indicates watch stopped by user.
 func IsEtcdWatchStoppedByUser(err error) bool {
 	return etcd.ErrWatchStoppedByUser == err
+}
+
+func IsEtcdEventIndexCleared(err error) bool {
+	etcdErr, ok := err.(*etcd.EtcdError)
+	return ok && etcdErr != nil && etcdErr.ErrorCode == EtcdErrorCodeIndexCleared
 }
 
 // Etcd client interface.
@@ -56,9 +62,15 @@ type Registry interface {
 	// It will create a new key value pair or replace the old one.
 	// It will not replace a existing directory.
 	Set(key string, value string, ttl uint64) (*etcd.Response, error)
+	// Update updates the given key to the given value. It succeeds only if the given key
+	// already exists.
+	Update(key string, value string, ttl uint64) (*etcd.Response, error)
 	// Create creates a file with the given value under the given key. It succeeds
 	// only if the given key does not yet exist.
 	Create(key string, value string, ttl uint64) (*etcd.Response, error)
+	// CreateInOrder creates a file with a key that's guaranteed to be higher than other
+	// keys in the given directory. It is useful for creating queues.
+	CreateInOrder(dir string, value string, ttl uint64) (*etcd.Response, error)
 	// CreateDir create a driectory. It succeeds only if the given key
 	// does not yet exist.
 	CreateDir(key string, ttl uint64) (*etcd.Response, error)

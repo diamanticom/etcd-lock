@@ -214,7 +214,7 @@ func (e *etcdLock) acquire() (ret error) {
 		if err != nil || resp.Node.Value == "" {
 			resp, err = e.client.Get(e.name, false, false)
 			if err != nil {
-				if IsEtcdErrorNotFound(err) {
+				if IsEtcdNotFound(err) {
 					// Try to acquire the lock.
 					glog.V(2).Infof("Trying to acquire lock %s", e.name)
 					resp, err = e.client.Create(e.name, e.id, e.ttl)
@@ -281,11 +281,11 @@ func (e *etcdLock) acquire() (ret error) {
 
 		// Start watching for changes to lock.
 		resp, err = e.client.Watch(e.name, prevIndex, false, nil, e.watchStopCh)
-		if IsEtcdErrorWatchStoppedByUser(err) {
+		if IsEtcdWatchStoppedByUser(err) {
 			glog.Infof("Watch for lock %s stopped by user", e.name)
 		} else if err != nil {
 			// Log only if its not too old event index error.
-			if !IsEtcdErrorEventIndexCleared(err) {
+			if !IsEtcdEventIndexCleared(err) {
 				glog.Errorf("Failed to watch lock %s, error %v",
 					e.name, err)
 			}
