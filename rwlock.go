@@ -41,11 +41,6 @@ limitations under the License.
 //    with lock-ttl.
 // 5) The queue entry is deleted in the unlock function or on ttl expiry.
 
-// NOTE:
-//
-// Please provide the following function to compile this code:
-// func GetLockID() (string, error)
-
 package utils
 
 import (
@@ -56,6 +51,7 @@ import (
 
 	"github.com/coreos/go-etcd/etcd"
 	"github.com/golang/glog"
+	"github.com/satori/go.uuid"
 )
 
 // Possible errors returned by Lock/Unlock.
@@ -71,6 +67,14 @@ var (
 )
 
 var QTTL = flag.Uint64("queue-ttl", 30, "Timeout in seconds for a lock queue entry")
+
+var (
+	lockID = uuid.NewV4().String()
+	// GetLockID returns identity of a lock requester.
+	GetLockID = func() (string, error) {
+		return lockID, nil
+	}
+)
 
 const (
 	kLocksDir = "/rwlocks" // Locks directory
@@ -143,8 +147,7 @@ func WUnlock(client Registry, name string, handle LockHandle) error {
 func rwLock(client Registry, lockType LockType, name string, ttl uint64) (LockHandle,
 	error) {
 
-	// id is the value to be stored against the lock request. It is node
-	// id + ":" + process id.
+	// id is the value to be stored against the lock request.
 	id, err := GetLockID()
 	if err != nil {
 		glog.Errorf("Unable to get lock id for lock %s", name)
