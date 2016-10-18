@@ -186,9 +186,12 @@ func (e *etcdLock) acquire() (ret error) {
 	err := fmt.Errorf("Dummy error")
 
 	for {
+		e.Lock()
+		enabled := e.enabled
+		e.Unlock()
 		// Stop was called, stop the refresh routine if needed and
 		// abort the acquire routine.
-		if !e.enabled {
+		if !enabled {
 			if e.holding {
 				glog.V(2).Infof("Deleting lock %s", e.name)
 				// Delete the lock so other nodes can get it sooner.
